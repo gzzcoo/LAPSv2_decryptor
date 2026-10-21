@@ -9,7 +9,7 @@ Python 3.10 or newer is required.
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
 The domain controller must be reachable over LDAP and MS-GKDI RPC (TCP 135 and the configured dynamic RPC port).
