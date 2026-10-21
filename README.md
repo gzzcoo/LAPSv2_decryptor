@@ -14,16 +14,6 @@ python -m pip install -r requirements.txt
 
 The domain controller must be reachable over LDAP and MS-GKDI RPC (TCP 135 and the configured dynamic RPC port).
 
-Set the target details used in the examples:
-
-```bash
-DC_IP='10.10.10.5'
-DC_HOST='dc01.example.local'
-DOMAIN='example.local'
-AD_USER='alice'
-COMPUTER='WS01$'
-```
-
 ## Authentication
 
 If `-p` is omitted, the tool prompts for the password. The examples use `-p 'your-password'` to make the credential mode explicit; replace the placeholder or omit `-p` and enter it at the prompt.
@@ -33,8 +23,8 @@ The NTLM examples require the domain controller to accept NTLM binds. Some domai
 ### NTLM with a password
 
 ```bash
-python lapsv2_decryptor.py -dc-ip "$DC_IP" -d "$DOMAIN" \
-  -u "$AD_USER" -p 'your-password' -target-computer "$COMPUTER"
+python3 LAPSv2_decryptor.py -dc-ip $DC_IP -d $DOMAIN \
+  -u 'user' -p 'password' -target-computer "COMPUTERNAME$"
 ```
 
 ### NTLM pass-the-hash
@@ -42,9 +32,8 @@ python lapsv2_decryptor.py -dc-ip "$DC_IP" -d "$DOMAIN" \
 Use `LMHASH:NTHASH`. Leave the LM hash empty with a leading colon when you only have the NT hash.
 
 ```bash
-python lapsv2_decryptor.py -dc-ip "$DC_IP" -d "$DOMAIN" \
-  -u "$AD_USER" -hashes ':0123456789abcdef0123456789abcdef' \
-  -target-computer "$COMPUTER"
+python3 LAPSv2_decryptor.py -dc-ip $DC_IP -d $DOMAIN \
+  -u 'user' -hashes ':613a519b5b0ef57c07bc6395aa1aff14' -target-computer "COMPUTERNAME$"
 ```
 
 ### Kerberos with a password
@@ -52,17 +41,17 @@ python lapsv2_decryptor.py -dc-ip "$DC_IP" -d "$DOMAIN" \
 `-dc-host` supplies the DC hostname used for Kerberos service names.
 
 ```bash
-python lapsv2_decryptor.py -dc-ip "$DC_IP" -dc-host "$DC_HOST" \
-  -d "$DOMAIN" -u "$AD_USER" -p 'your-password' -k \
-  -target-computer "$COMPUTER"
+python3 LAPSv2_decryptor.py -dc-ip $DC_IP -dc-host $DC_HOST \
+  -d $DOMAIN -u 'user' -p 'password' -k \
+  -target-computer "COMPUTERNAME$"
 ```
 
 ### Kerberos with an NTLM hash
 
 ```bash
-python lapsv2_decryptor.py -dc-ip "$DC_IP" -dc-host "$DC_HOST" \
-  -d "$DOMAIN" -u "$AD_USER" -hashes ':0123456789abcdef0123456789abcdef' -k \
-  -target-computer "$COMPUTER"
+python3 LAPSv2_decryptor.py -dc-ip $DC_IP -dc-host $DC_HOST \
+  -d $DOMAIN -u 'user' -hashes ':613a519b5b0ef57c07bc6395aa1aff14' -k \
+  -target-computer "COMPUTERNAME$"
 ```
 
 ### Kerberos with a credential cache
@@ -70,10 +59,10 @@ python lapsv2_decryptor.py -dc-ip "$DC_IP" -dc-host "$DC_HOST" \
 Point `KRB5CCNAME` to a valid ticket cache and use `-no-pass` to prevent a password prompt.
 
 ```bash
-export KRB5CCNAME="$PWD/alice.ccache"
-python lapsv2_decryptor.py -dc-ip "$DC_IP" -dc-host "$DC_HOST" \
-  -d "$DOMAIN" -u "$AD_USER" -k -no-pass \
-  -target-computer "$COMPUTER"
+export KRB5CCNAME=user.ccache
+python3 LAPSv2_decryptor.py -dc-ip $DC_IP -dc-host $DC_HOST \
+  -d $DOMAIN -u 'user' -k -no-pass \
+  -target-computer "COMPUTERNAME$"
 ```
 
 ## Output
