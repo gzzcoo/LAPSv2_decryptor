@@ -69,4 +69,6 @@ python3 LAPSv2_decryptor.py -dc-ip $DC_IP -dc-host $DC_HOST \
 
 The default output shows the computer, local account, and password. Add `--json` for machine-readable output. `-debug` prints protocol details and key material; keep that output private.
 
+`--include-history` also decrypts values from `msLAPS-EncryptedPasswordHistory`.
+
 `-base-dn` is optional. When omitted, the base DN is built from `-d`.

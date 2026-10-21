@@ -378,29 +378,31 @@ def progress(number, phase, message):
 def error(message):
     print('[!] %s' % message, file=sys.stderr)
 
-def print_laps_result(target, result, as_json=False):
-    if as_json or not isinstance(result, dict):
-        print(json.dumps(result, indent=2, ensure_ascii=False) if as_json and isinstance(result, dict) else result)
+def print_laps_result(target, results, as_json=False):
+    if as_json:
+        print(json.dumps(results, indent=2, ensure_ascii=False))
         return
 
-    rows = [('Computer', target)]
-    if result.get('n') is not None:
-        rows.append(('Local account', str(result['n'])))
-    if result.get('p') is not None:
-        rows.append(('Password', str(result['p'])))
+    if not isinstance(results, list):
+        results = [results]
 
-    if len(rows) == 1:
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-        return
-
-    label_width = max(len(label) for label, _ in rows)
     print()
-    for label, value in rows:
-        print('%s : %s' % (label.ljust(label_width), value))
+    print('Computer : %s' % target)
+    for result in results:
+        if not isinstance(result, dict):
+            print(result)
+            continue
+        attr = result.get('attr', 'msLAPS-EncryptedPassword')
+        index = result.get('index', 0)
+        section = 'Current password' if attr.lower() == 'mslaps-encryptedpassword' else 'History [%s]' % index
+        print('%s:' % section)
+        if result.get('n') is not None:
+            print('  Account  : %s' % result['n'])
+        if result.get('p') is not None:
+            print('  Password : %s' % result['p'])
 
 def ldap_request(ldap_server, domain, username, password, base_dn, target_computer,
-                 doKerberos=False, lmhash='', nthash='', dcHost=None):
-    data = None
+                 doKerberos=False, lmhash='', nthash='', dcHost=None, include_history=False):
     if not base_dn:
         domain_labels = [label for label in domain.strip('.').split('.') if label]
         if not domain_labels:
@@ -408,8 +410,29 @@ def ldap_request(ldap_server, domain, username, password, base_dn, target_comput
         base_dn = ','.join('DC=' + label for label in domain_labels)
 
     computer_name = target_computer.rstrip('$')
-    search_filter = '(&(objectCategory=computer)(|(msLAPS-EncryptedPassword=*)(ms-MCS-AdmPwd=*)(msLAPS-Password=*))(name=' + computer_name + '))'
-    attributes = ['msLAPS-EncryptedPassword', 'msLAPS-Password', 'sAMAccountName']
+    laps_attributes = ['msLAPS-EncryptedPassword']
+    if include_history:
+        laps_attributes.append('msLAPS-EncryptedPasswordHistory')
+    search_filter = '(&(objectCategory=computer)(|%s)(name=%s))' % (
+        ''.join('(%s=*)' % attribute for attribute in laps_attributes), computer_name
+    )
+    attributes = laps_attributes + ['msLAPS-Password', 'sAMAccountName']
+    blobs = []
+
+    def add_blob(attribute_name, index, value):
+        if hasattr(value, 'asOctets'):
+            value = value.asOctets()
+        blobs.append({'attr': attribute_name, 'index': index, 'data': value})
+
+    def get_field(entry, name):
+        if isinstance(entry, dict):
+            return entry.get(name)
+        if hasattr(entry, 'getComponentByName'):
+            return entry.getComponentByName(name)
+        try:
+            return entry[name]
+        except (KeyError, TypeError, IndexError):
+            return None
 
     if doKerberos:
         # A hostname is required for the LDAP SPN. Prefer the explicit DC host,
@@ -438,17 +461,18 @@ def ldap_request(ldap_server, domain, username, password, base_dn, target_comput
             results = ldap_connection.search(searchBase=base_dn, searchFilter=search_filter,
                                              attributes=attributes)
             for result in results:
-                for attribute in result['attributes']:
-                    if str(attribute['type']).lower() == 'mslaps-encryptedpassword':
-                        values = attribute['vals']
-                        if len(values):
-                            data = values[0].asOctets()
-                            break
-                if data is not None:
-                    break
+                result_attributes = get_field(result, 'attributes')
+                if result_attributes is None:
+                    continue
+                for attribute in result_attributes:
+                    attribute_name = str(get_field(attribute, 'type'))
+                    if attribute_name.lower() in [name.lower() for name in laps_attributes]:
+                        values = get_field(attribute, 'vals') or []
+                        for index, value in enumerate(values):
+                            add_blob(attribute_name, index, value)
         finally:
             ldap_connection.close()
-        return data
+        return blobs
 
     ldap_server = Server("ldap://%s" % ldap_server)
     ntlm_password = password
@@ -459,9 +483,12 @@ def ldap_request(ldap_server, domain, username, password, base_dn, target_comput
     with Connection(ldap_server, user="%s\\%s" % (domain, username), password=ntlm_password, authentication=NTLM, auto_bind=True) as ldap_connection:
         search_result = ldap_connection.search(search_filter=search_filter, search_base=base_dn, attributes=attributes)
         if search_result:
-            results = ldap_connection.response
-            data = results[0]['raw_attributes']['msLAPS-EncryptedPassword'][0]
-    return data
+            for result in ldap_connection.response:
+                raw_attributes = result.get('raw_attributes', {})
+                for attribute_name in laps_attributes:
+                    for index, value in enumerate(raw_attributes.get(attribute_name, [])):
+                        add_blob(attribute_name, index, value)
+    return blobs
 
 def connect(username, password, domain, lmhash, nthash, doKerberos, dcHost, dcIp=None):
     MSRPC_UUID_GKDI = uuidtup_to_bin(('B9785960-524F-11DF-8B6D-83DCDED72085','1.0'))
@@ -648,6 +675,114 @@ def compute_l2_key(key_id: KeyIdentifier, gke: GroupKeyEnvelope):
 def little_to_big(data):
     return data[::-1]
 
+def decrypt_laps_blob(data, options, lmhash, nthash):
+        # 2. Unpack the encrypted blob to get KeyIdentifier and all the infos
+        if options.debug:
+            print('[-] Unpacking blob')
+        rawblob = EncryptedPasswordBlob(data)
+        parsed_cms_data, remaining = decoder.decode(rawblob['Blob'], asn1Spec=rfc5652.ContentInfo())
+        enveloped_data_blob = parsed_cms_data['content']
+        parsed_enveloped_data, _ = decoder.decode(enveloped_data_blob, asn1Spec=rfc5652.EnvelopedData())
+
+        recipient_infos = parsed_enveloped_data['recipientInfos']
+        kek_recipient_info = recipient_infos[0]['kekri']
+        kek_identifier = kek_recipient_info['kekid']
+        key_id = KeyIdentifier(bytes(kek_identifier['keyIdentifier']))
+        tmp,_ = decoder.decode(kek_identifier['other']['keyAttr'])
+        sid = tmp['field-1'][0][0][1].asOctets().decode("utf-8")
+        target_sd = create_sd(sid)
+        if options.debug:
+            key_id.dump()
+
+        # 3. Connect on RPC over TCP to MS-GKDI to call opnum 0 GetKey
+        dce = connect(username=options.username, password=options.password, domain=options.domain, lmhash=lmhash, nthash=nthash, doKerberos=options.k, dcHost=options.dc_host or options.dc_ip, dcIp=options.dc_ip)
+        if dce is None:
+            return
+        if options.debug:
+            print("[-] Calling MS-GKDI GetKey")
+        try:
+            resp = GkdiGetKey(dce, target_sd=target_sd, l0=key_id['L0Index'], l1=key_id['L1Index'], l2=key_id['L2Index'], root_key_id=key_id['RootKeyId'])
+        finally:
+            dce.disconnect()
+
+        # 4. Unpack GroupKeyEnvelope
+        gke = GroupKeyEnvelope(b''.join(resp['pbbOut']))
+        if options.debug:
+            gke.dump()
+
+        # 5. Compute KEK
+        if options.debug:
+            print('[-] Computing L2 Key')
+        l2_key = compute_l2_key(key_id, gke)
+
+        kek_secret = None
+        kek_context = None
+
+        if key_id.is_public_key():
+            if options.debug:
+                print('[-] Computing Private Key')
+            private_key = kdf(
+                gke["KdfPara"]["HashName"].decode('utf-16le'),
+                l2_key,
+                KDS_SERVICE_LABEL,
+                gke['SecAlgo'],
+                math.ceil(gke["PrivKeyLength"] / 8),
+            )
+            if gke['SecAlgo'].decode('utf-16le').encode() == b"DH\0":
+                ffcdh_key = FFCDHKey(key_id["Unknown"])
+                if options.debug:
+                    print('[-] Computing Shared Secret based on Diffie-Helmann')
+                shared_secret_int = pow(
+                    int.from_bytes(ffcdh_key['PubKey'], byteorder="big"),
+                    int.from_bytes(private_key, byteorder="big"),
+                    int.from_bytes(ffcdh_key['FieldOrder'], byteorder="big"),
+                )
+                shared_secret = shared_secret_int.to_bytes((shared_secret_int.bit_length() + 7) // 8, byteorder="big")
+
+            kek_context = "KDS public key\0".encode("utf-16le")
+            otherinfo = "SHA512\0".encode("utf-16le") + kek_context + KDS_SERVICE_LABEL
+            kek_secret = ConcatKDFHash(hashes.SHA256(), length=32, otherinfo=otherinfo).derive(shared_secret)
+
+        else:
+            kek_secret = l2_key
+            kek_context = key_id["Unknown"]
+
+        if options.debug:
+            print('[-] Computing KEK')
+        kek = kdf(
+            gke["KdfPara"]["HashName"].decode('utf-16le'),
+            kek_secret,
+            KDS_SERVICE_LABEL,
+            kek_context,
+            32
+        )
+        if options.debug:
+            print('KEK: %s' % kek)
+
+        # 6. Unwrap CEK
+        if options.debug:
+            print('[-] Unwraping CEK')
+        cek = keywrap.aes_key_unwrap(kek, bytes(kek_recipient_info['encryptedKey']))
+        if options.debug:
+            print('CEK: %s' % cek)
+
+        enc_content_parameter = bytes(parsed_enveloped_data["encryptedContentInfo"]["contentEncryptionAlgorithm"]["parameters"])
+        iv, _ = decoder.decode(enc_content_parameter)
+        if options.debug:
+            print('[-] Got IV')
+        if options.debug:
+            print('IV: %s' % bytes(iv[0]))
+
+        # 7. Decrypt the encrypted content with CEK
+        cipher = AESGCM(cek)
+        output = cipher.decrypt(bytes(iv[0]), remaining, None)
+        plaintext = output.decode('utf-16le').rstrip('\x00')
+        try:
+            parsed_output = json.loads(plaintext)
+        except json.JSONDecodeError:
+            parsed_output = plaintext
+        return parsed_output
+
 def main():
     parser = argparse.ArgumentParser(add_help = True, description = "Dump LAPSv2")
     parser.add_argument('-u', '--username', action="store", default='', help='valid username')
@@ -663,6 +798,7 @@ def main():
     parser.add_argument('-base-dn', action="store", default='', help='Base DN')
     parser.add_argument('-debug', action="store_true", help='Show internal structures and key material for troubleshooting')
     parser.add_argument('--json', action="store_true", help='Print the decrypted LAPS record as JSON')
+    parser.add_argument('--include-history', action="store_true", help='Also decrypt msLAPS-EncryptedPasswordHistory values')
 
 
     options = parser.parse_args()
@@ -685,118 +821,39 @@ def main():
         from getpass import getpass
         options.password = getpass("Password:")
 
-    # 1. Get the blob from LDAP
+    # 1. Get the encrypted password blobs from LDAP
     progress(1, 'LDAP', 'Querying msLAPS for %s' % options.target_computer)
-    data = ldap_request(options.dc_ip, options.domain, options.username, options.password, options.base_dn, options.target_computer, options.k, lmhash, nthash, options.dc_host)
-    if data == None:
+    blobs = ldap_request(options.dc_ip, options.domain, options.username, options.password,
+                         options.base_dn, options.target_computer, options.k, lmhash,
+                         nthash, options.dc_host, options.include_history)
+    if not blobs:
         error('No encrypted LAPS blob was found for the target computer')
         return
 
-    # 2. Unpack the encrypted blob to get KeyIdentifier and all the infos
-    if options.debug:
-        print('[-] Unpacking blob')
-    rawblob = EncryptedPasswordBlob(data)
-    parsed_cms_data, remaining = decoder.decode(rawblob['Blob'], asn1Spec=rfc5652.ContentInfo())
-    enveloped_data_blob = parsed_cms_data['content']
-    parsed_enveloped_data, _ = decoder.decode(enveloped_data_blob, asn1Spec=rfc5652.EnvelopedData())
-
-    recipient_infos = parsed_enveloped_data['recipientInfos']
-    kek_recipient_info = recipient_infos[0]['kekri']
-    kek_identifier = kek_recipient_info['kekid']
-    key_id = KeyIdentifier(bytes(kek_identifier['keyIdentifier']))
-    tmp,_ = decoder.decode(kek_identifier['other']['keyAttr'])
-    sid = tmp['field-1'][0][0][1].asOctets().decode("utf-8")
-    target_sd = create_sd(sid)
-    if options.debug:
-        key_id.dump()
-
-    # 3. Connect on RPC over TCP to MS-GKDI to call opnum 0 GetKey
-    progress(2, 'MS-GKDI', 'Requesting decryption keys from the domain controller')
-    dce = connect(username=options.username, password=options.password, domain=options.domain, lmhash=lmhash, nthash=nthash, doKerberos=options.k, dcHost=options.dc_host or options.dc_ip, dcIp=options.dc_ip)
-    if dce is None:
-        return
-    if options.debug:
-        print("[-] Calling MS-GKDI GetKey")
-    resp = GkdiGetKey(dce, target_sd=target_sd, l0=key_id['L0Index'], l1=key_id['L1Index'], l2=key_id['L2Index'], root_key_id=key_id['RootKeyId'])
-
-    # 4. Unpack GroupKeyEnvelope
-    gke = GroupKeyEnvelope(b''.join(resp['pbbOut']))
-    if options.debug:
-        gke.dump()
-
-    # 5. Compute KEK
-    progress(3, 'Decryption', 'Deriving keys and decrypting the LAPS record')
-    if options.debug:
-        print('[-] Computing L2 Key')
-    l2_key = compute_l2_key(key_id, gke)
-
-    kek_secret = None
-    kek_context = None
-
-    if key_id.is_public_key():
+    progress(2, 'MS-GKDI', 'Requesting keys and decrypting %d LAPS record(s)' % len(blobs))
+    decrypted_results = []
+    for blob in blobs:
         if options.debug:
-            print('[-] Computing Private Key')
-        private_key = kdf(
-            gke["KdfPara"]["HashName"].decode('utf-16le'),
-            l2_key,
-            KDS_SERVICE_LABEL,
-            gke['SecAlgo'],
-            math.ceil(gke["PrivKeyLength"] / 8),
-        )
-        if gke['SecAlgo'].decode('utf-16le').encode() == b"DH\0":
-            ffcdh_key = FFCDHKey(key_id["Unknown"])
-            if options.debug:
-                print('[-] Computing Shared Secret based on Diffie-Helmann')
-            shared_secret_int = pow(
-                int.from_bytes(ffcdh_key['PubKey'], byteorder="big"),
-                int.from_bytes(private_key, byteorder="big"),
-                int.from_bytes(ffcdh_key['FieldOrder'], byteorder="big"),
-            )
-            shared_secret = shared_secret_int.to_bytes((shared_secret_int.bit_length() + 7) // 8, byteorder="big")
+            print('[-] Decrypting %s[%s]' % (blob['attr'], blob['index']))
+        parsed_output = decrypt_laps_blob(blob['data'], options, lmhash, nthash)
+        if parsed_output is None:
+            continue
+        if options.include_history:
+            if isinstance(parsed_output, dict):
+                parsed_output = dict(parsed_output)
+                parsed_output['attr'] = blob['attr']
+                parsed_output['index'] = blob['index']
+            else:
+                parsed_output = {'attr': blob['attr'], 'index': blob['index'], 'value': parsed_output}
+        decrypted_results.append(parsed_output)
 
-        kek_context = "KDS public key\0".encode("utf-16le")
-        otherinfo = "SHA512\0".encode("utf-16le") + kek_context + KDS_SERVICE_LABEL
-        kek_secret = ConcatKDFHash(hashes.SHA256(), length=32, otherinfo=otherinfo).derive(shared_secret)
+    if not decrypted_results:
+        error('No LAPS passwords were successfully decrypted')
+        return
+    progress(3, 'Decryption', 'Successfully decrypted %d LAPS record(s)' % len(decrypted_results))
+    output = decrypted_results if options.include_history else decrypted_results[0]
+    print_laps_result(options.target_computer, output, options.json)
 
-    else:
-        kek_secret = l2_key
-        kek_context = key_id["Unknown"]
-
-    if options.debug:
-        print('[-] Computing KEK')
-    kek = kdf(
-        gke["KdfPara"]["HashName"].decode('utf-16le'),
-        kek_secret,
-        KDS_SERVICE_LABEL,
-        kek_context,
-        32
-    )
-    if options.debug:
-        print('KEK: %s' % kek)
-
-    # 6. Unwrap CEK
-    if options.debug:
-        print('[-] Unwraping CEK')
-    cek = keywrap.aes_key_unwrap(kek, bytes(kek_recipient_info['encryptedKey']))
-    if options.debug:
-        print('CEK: %s' % cek)
-
-    enc_content_parameter = bytes(parsed_enveloped_data["encryptedContentInfo"]["contentEncryptionAlgorithm"]["parameters"])
-    iv, _ = decoder.decode(enc_content_parameter)
-    if options.debug:
-        print('[-] Got IV')
-    if options.debug:
-        print('IV: %s' % bytes(iv[0]))
-
-    # 7. Decrypt the encrypted content with CEK
-    cipher = AESGCM(cek)
-    output = cipher.decrypt(bytes(iv[0]), remaining, None)
-    plaintext = output.decode('utf-16le').rstrip('\x00')
-    try:
-        parsed_output = json.loads(plaintext)
-    except json.JSONDecodeError:
-        parsed_output = plaintext
-    print_laps_result(options.target_computer, parsed_output, options.json)
 
 if __name__ == "__main__":
     main()
