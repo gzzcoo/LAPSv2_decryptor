@@ -1,10 +1,10 @@
 # LAPSv2 decryptor
 
-Decrypts Windows LAPS v2 `msLAPS-EncryptedPassword` values. It reads the encrypted value from LDAP, requests the key material from MS-GKDI over RPC, then decrypts the password locally.
+Decrypts Windows LAPS v2 `msLAPS-EncryptedPassword` values. It reads the encrypted value from LDAP, requests key material from MS-GKDI over RPC, and decrypts the record locally.
 
 ## Install
 
-Use Python 3.10 or newer.
+Python 3.10 or newer is required.
 
 ```bash
 python3 -m venv .venv
@@ -12,38 +12,72 @@ python3 -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-The target must be reachable over LDAP and MS-GKDI RPC. MS-GKDI uses the RPC endpoint mapper and a dynamic RPC port.
+The domain controller must be reachable over LDAP and MS-GKDI RPC (TCP 135 and the configured dynamic RPC port).
 
-## Run
-
-The tool prompts for a password if `-p` is omitted.
+Set the target details used in the examples:
 
 ```bash
-python lapsv2_decryptor.py \
-  -dc-ip 10.10.10.5 \
-  -dc-host dc01.example.local \
-  -d example.local \
-  -u alice \
-  -k \
-  -target-computer WS01$
+DC_IP='10.10.10.5'
+DC_HOST='dc01.example.local'
+DOMAIN='example.local'
+AD_USER='alice'
+COMPUTER='WS01$'
 ```
 
-For a Kerberos ticket already in the credential cache:
+## Authentication
+
+If `-p` is omitted, the tool prompts for the password. The examples use `-p 'your-password'` to make the credential mode explicit; replace the placeholder or omit `-p` and enter it at the prompt.
+
+The NTLM examples require the domain controller to accept NTLM binds. Some domains disable NTLM; use one of the Kerberos modes in that case.
+
+### NTLM with a password
 
 ```bash
-KRB5CCNAME=/path/to/ticket.ccache python lapsv2_decryptor.py \
-  -dc-ip 10.10.10.5 \
-  -dc-host dc01.example.local \
-  -d example.local \
-  -u alice \
-  -k -no-pass \
-  -target-computer WS01$
+python lapsv2_decryptor.py -dc-ip "$DC_IP" -d "$DOMAIN" \
+  -u "$AD_USER" -p 'your-password' -target-computer "$COMPUTER"
 ```
 
-Without `-k`, the tool uses NTLM. `-base-dn` is optional; when omitted, the base DN is built from `-d`.
+### NTLM pass-the-hash
 
-The default output shows the target, local account, and password. Use `--json` for machine-readable output. `-debug` prints protocol details and key material; keep that output private.
+Use `LMHASH:NTHASH`. Leave the LM hash empty with a leading colon when you only have the NT hash.
 
-## Notes
+```bash
+python lapsv2_decryptor.py -dc-ip "$DC_IP" -d "$DOMAIN" \
+  -u "$AD_USER" -hashes ':0123456789abcdef0123456789abcdef' \
+  -target-computer "$COMPUTER"
+```
 
-This tool handles encrypted Windows LAPS v2 values. It does not retrieve a password when the account lacks permission to read the encrypted attribute or obtain the required key material.
+### Kerberos with a password
+
+`-dc-host` supplies the DC hostname used for Kerberos service names.
+
+```bash
+python lapsv2_decryptor.py -dc-ip "$DC_IP" -dc-host "$DC_HOST" \
+  -d "$DOMAIN" -u "$AD_USER" -p 'your-password' -k \
+  -target-computer "$COMPUTER"
+```
+
+### Kerberos with an NTLM hash
+
+```bash
+python lapsv2_decryptor.py -dc-ip "$DC_IP" -dc-host "$DC_HOST" \
+  -d "$DOMAIN" -u "$AD_USER" -hashes ':0123456789abcdef0123456789abcdef' -k \
+  -target-computer "$COMPUTER"
+```
+
+### Kerberos with a credential cache
+
+Point `KRB5CCNAME` to a valid ticket cache and use `-no-pass` to prevent a password prompt.
+
+```bash
+export KRB5CCNAME="$PWD/alice.ccache"
+python lapsv2_decryptor.py -dc-ip "$DC_IP" -dc-host "$DC_HOST" \
+  -d "$DOMAIN" -u "$AD_USER" -k -no-pass \
+  -target-computer "$COMPUTER"
+```
+
+## Output
+
+The default output shows the computer, local account, and password. Add `--json` for machine-readable output. `-debug` prints protocol details and key material; keep that output private.
+
+`-base-dn` is optional. When omitted, the base DN is built from `-d`.

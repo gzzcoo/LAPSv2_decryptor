@@ -451,7 +451,12 @@ def ldap_request(ldap_server, domain, username, password, base_dn, target_comput
         return data
 
     ldap_server = Server("ldap://%s" % ldap_server)
-    with Connection(ldap_server, user="%s\\%s" % (domain, username), password=password, authentication=NTLM, auto_bind=True) as ldap_connection:
+    ntlm_password = password
+    if lmhash or nthash:
+        # ldap3 accepts NTLM hashes in the password field as LMHASH:NTHASH.
+        # Use the standard empty LM hash when only an NT hash was supplied.
+        ntlm_password = '%s:%s' % (lmhash or 'aad3b435b51404eeaad3b435b51404ee', nthash)
+    with Connection(ldap_server, user="%s\\%s" % (domain, username), password=ntlm_password, authentication=NTLM, auto_bind=True) as ldap_connection:
         search_result = ldap_connection.search(search_filter=search_filter, search_base=base_dn, attributes=attributes)
         if search_result:
             results = ldap_connection.response
@@ -491,7 +496,7 @@ def connect(username, password, domain, lmhash, nthash, doKerberos, dcHost, dcIp
     try:
         dce.connect()
     except Exception as e:
-        error('No se pudo conectar al endpoint MS-GKDI: %s' % e)
+        error('Could not connect to the MS-GKDI endpoint: %s' % e)
         return None
     cache_name = None
     direct_kerberos = doKerberos and (password or lmhash or nthash)
@@ -503,7 +508,7 @@ def connect(username, password, domain, lmhash, nthash, doKerberos, dcHost, dcIp
     try:
         dce.bind(MSRPC_UUID_GKDI)
     except Exception as e:
-        error('Falló la autenticación MS-GKDI: %s' % e)
+        error('MS-GKDI authentication failed: %s' % e)
         return None
     finally:
         if cache_name is not None:
@@ -648,12 +653,10 @@ def main():
     parser.add_argument('-u', '--username', action="store", default='', help='valid username')
     parser.add_argument('-p', '--password', action="store", default='', help='valid password (if omitted, it will be asked unless -no-pass)')
     parser.add_argument('-d', '--domain', action="store", default='', help='valid domain name')
-    parser.add_argument('-hashes', action="store", metavar="[LMHASH]:NTHASH", help='NT/LM hashes (LM hash can be empty)')
+    parser.add_argument('-hashes', action="store", metavar="[LMHASH]:NTHASH", help='NTLM hashes for pass-the-hash (LM hash may be empty)')
 
-    parser.add_argument('-no-pass', action="store_true", help='don\'t ask for password (useful for -k)')
-    parser.add_argument('-k', action="store_true", help='Use Kerberos authentication. With -p or -hashes, '
-                        'obtains Kerberos credentials directly. With -no-pass, uses the ticket cache '
-                        'selected by KRB5CCNAME.')
+    parser.add_argument('-no-pass', action="store_true", help='Do not prompt for a password; with -k, use the KRB5CCNAME ticket cache')
+    parser.add_argument('-k', action="store_true", help='Use Kerberos with a password or hashes; -no-pass uses the KRB5CCNAME ticket cache')
     parser.add_argument('-dc-ip', action="store", metavar="ip address", help='IP Address of the domain controller. If omitted it will use the domain part (FQDN) specified in the target parameter')
     parser.add_argument('-dc-host', action="store", metavar="hostname", help='Domain controller hostname used for Kerberos service principal names')
     parser.add_argument('-target-computer', action="store", default='', help='Computer that you want the laps admin password')
@@ -667,7 +670,13 @@ def main():
         parser.error('--json cannot be combined with -debug')
 
     if options.hashes is not None:
-        lmhash, nthash = options.hashes.split(':')
+        if ':' not in options.hashes:
+            parser.error('-hashes must be in LMHASH:NTHASH format; use :NTHASH when the LM hash is empty')
+        lmhash, nthash = options.hashes.split(':', 1)
+        if not nthash or len(nthash) != 32 or any(c not in '0123456789abcdefABCDEF' for c in nthash):
+            parser.error('NTHASH must be 32 hexadecimal characters')
+        if lmhash and (len(lmhash) != 32 or any(c not in '0123456789abcdefABCDEF' for c in lmhash)):
+            parser.error('LMHASH must be empty or 32 hexadecimal characters')
     else:
         lmhash = ''
         nthash = ''
